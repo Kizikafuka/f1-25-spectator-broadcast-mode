@@ -1,6 +1,6 @@
 # Spectator/Broadcast Mode
 
-**Version 0.0.32 (experimental)** · by Kizi & RK · id `kizi.spectator-hud` · F1 25 (Steam), Swofty Launcher 1.6 or newer
+**Version 0.0.34 (experimental)** · by Kizi & RK · id `kizi.spectator-hud` · F1 25 (Steam), Swofty Launcher 1.6 or newer
 
 > ### Notice: AI Drive + Spectate is being split
 > The old addon **AI Drive + Spectate** (`kizikafuka.ai-drive`) will be **removed** and replaced by **two separate addons**:
