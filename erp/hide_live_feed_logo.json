@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "ops": [
+    {
+      "op": "replace-resource",
+      "when": { "hide_2026_logo": true },
+      "erp": "2025_asset_groups/ui_package/screens/hud_spectator_2.erp",
+      "resource": "eaid://ui_package/art/osd/screens/spectator_mode_2.idf",
+      "fragment": 0,
+      "source": "ui/spectator_mode_2.idf"
+    },
+    {
+      "op": "replace-resource",
+      "when": { "hide_2026_logo": true },
+      "erp": "2025_asset_groups/ui_package/flow_race.erp",
+      "resource": "eaid://ui_package/art/osd/screens/spectator_mode_2.idf",
+      "fragment": 0,
+      "source": "ui/spectator_mode_2.idf"
+    }
+  ]
+}
