@@ -3,7 +3,7 @@
   "id": "kizi.spectator-hud",
   "name": "Spectator/Broadcast Mode",
   "version": "0.0.33",
-  "author": "Kizi",
+  "author": "Kizi & RK",
   "description": "Keep your race running after a crash and watch from the broadcast camera, or start the race parked in the garage. First part of the split AI Drive. Idea: Terminal Damage by nyannoying.",
   "license": "MIT",
   "icon": "icon.png",

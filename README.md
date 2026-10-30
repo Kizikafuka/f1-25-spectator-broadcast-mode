@@ -1,6 +1,6 @@
 # Spectator/Broadcast Mode
 
-**Version 0.0.32 (experimental)** · by Kizikafuka · id `kizi.spectator-hud` · F1 25 (Steam), Swofty Launcher 1.6 or newer
+**Version 0.0.32 (experimental)** · by Kizi & RK · id `kizi.spectator-hud` · F1 25 (Steam), Swofty Launcher 1.6 or newer
 
 > ### Notice: AI Drive + Spectate is being split
 > The old addon **AI Drive + Spectate** (`kizikafuka.ai-drive`) will be **removed** and replaced by **two separate addons**:
@@ -42,6 +42,7 @@ Watch the race from the game's broadcast camera while your own car is out of the
 ## Credits
 - The idea of keeping your car and the race going after terminal damage comes from [Terminal Damage](https://github.com/nyannoying1337/f1-25-terminal-damage) by nyannoying. This addon has its own code, doesn't need Terminal Damage, and isn't made by or endorsed by nyannoying. Thank you for the idea and for being open about it!
 - Thanks to Swofty for the official game bindings used here (garage call, spectator camera and HUD hooks).
+- Made by **Kizi and RK**. The spectate code comes from AI Drive + Spectate by Kizi and RK.
 
 ## Build it yourself
 
