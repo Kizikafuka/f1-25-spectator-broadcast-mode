@@ -11,7 +11,7 @@ if ($LASTEXITCODE -ne 0) { throw "compile failed" }
 $stage = Join-Path $env:TEMP "spectator_broadcast_mode_stage"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force "$stage\native" | Out-Null
-Copy-Item swofty.json, icon.png, README.md, LICENSE $stage
+Copy-Item swofty.json, registry.json, icon.png, README.md, LICENSE $stage
 Copy-Item native\kizi_spectator_hud.dll "$stage\native"
 Copy-Item erp, ui -Destination $stage -Recurse
 New-Item -ItemType Directory -Force dist | Out-Null

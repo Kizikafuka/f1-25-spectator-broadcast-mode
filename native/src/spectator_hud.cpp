@@ -7,10 +7,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -26,11 +26,25 @@
 #include <swofty/systems/spectator.hpp>
 #include <swofty/telemetry.hpp>
 
+#include "tv_director.hpp"
+// KIZI_PARK = 1 only in the private PPS build: park the extra F1 World entry at the safety car's spot (it needs the car tables of
+// kizi_cars.hpp). The public addon is built with 0 and has none of that code.
+#ifndef KIZI_PARK
+#define KIZI_PARK 0
+#endif
+#if KIZI_PARK
+#include "kizi_cars.hpp"
+#endif
+
 namespace swofty::game {
 using Game_Pitlane_SetVehicleStatus_t = uint64_t(void *, uint64_t, uint64_t);
 inline constexpr fn<"Game_Pitlane_SetVehicleStatus", Game_Pitlane_SetVehicleStatus_t> Game_Pitlane_SetVehicleStatus{};
 using Sess_SpectatorHud_Hide_t = void();
 inline constexpr fn<"Sess_SpectatorHud_Hide", Sess_SpectatorHud_Hide_t> Sess_SpectatorHud_Hide{};
+#if KIZI_PARK
+using Game_Place_Vehicle_t = void(void *car, const char *tag, int priority, const float *mtx_a, const float *mtx_b, float dt, uint32_t flags);
+inline constexpr fn<"Game_Place_Vehicle", Game_Place_Vehicle_t> Game_Place_Vehicle{};
+#endif
 using Ne_Post_BusMessage_t = uint64_t(void *, void *);
 inline constexpr fn<"Ne_Post_BusMessage", Ne_Post_BusMessage_t> Ne_Post_BusMessage{};
 }
@@ -45,6 +59,7 @@ inline constexpr fn<"Ne_Post_BusMessage", Ne_Post_BusMessage_t> Ne_Post_BusMessa
 #define TAG "spectator"
 
 SWOFTY_SETTING(bool, auto_on, true);
+SWOFTY_SETTING(std::string_view, tv_director, "off");
 SWOFTY_SETTING(std::string_view, hotkey, "F4");
 SWOFTY_SETTING(bool, leave_own_car, true);
 SWOFTY_SETTING(std::string_view, camera_key, "C");
@@ -52,6 +67,11 @@ SWOFTY_SETTING(bool, keep_race, true);
 SWOFTY_SETTING(std::string_view, garage_after, "6");
 SWOFTY_SETTING(bool, start_garage, false);
 SWOFTY_SETTING(bool, park_teammate, true);
+#if KIZI_PARK
+SWOFTY_SETTING(std::string_view, park_where, "garage");
+SWOFTY_SETTING(std::string_view, park_behind, "15");
+SWOFTY_SETTING(bool, park_control, false);
+#endif
 SWOFTY_SETTING(bool, bg_run, true);
 SWOFTY_SETTING(std::string_view, udp_port, "20777");
 SWOFTY_SETTING(std::string_view, udp_forward, "off");
@@ -125,12 +145,6 @@ int key_vk(std::string_view k)
     return 0;   // "none"
 }
 
-const char *rname(swofty::sessions::Result r)
-{
-    using R = swofty::sessions::Result;
-    return r == R::ok ? "ok" : r == R::late ? "late" : r == R::unavailable ? "unavailable" : r == R::blocked ? "blocked" : "invalid";
-}
-
 std::atomic<int> g_player{-1};   // your vehicle index, learnt from the session events
 
 std::atomic<bool> kc_broken{false};  // the terminal damage message was dropped for your car
@@ -147,14 +161,27 @@ struct EntrantInfo {
 std::vector<EntrantInfo> g_entrants;
 std::mutex g_entrants_mu;
 
+double sess_t0 = 0;                  // session.start time (your car is looked for a few seconds later)
+double next_learn = 0;
 double sg_t0 = 0;                    // race.start seen at this time: the start-in-garage countdown (0 = off / done)
 int sg_tries_log = 0;
 std::atomic<bool> sg_parked{false};   // start-in-garage: your car was parked (maybe before the race started)
 std::atomic<bool> sg_race{false};     // race.start was seen in this session
+std::atomic<bool> g_reset_new_session{false};   // the reset came from session.start (a restart keeps your off choice)
+double g_late_cleanup[3] = {0, 0, 0};   // after a restart the game rebuilds its HUD a little later: clean up again then
 std::atomic<bool> g_reset_req{false};   // race.start / session.start seen: reset everything on the next tick
+
+// The session type from the session events (practice 0, qualifying 1, race 2, sprint 3, time trial 4; -1 = not known). The rule "move off a
+// car that is out" only makes sense in a race: in practice and qualifying most cars sit in the pit lane or garage on purpose.
+std::atomic<int> g_session_type{-1};
 
 void note_player(const swofty::events::Context &ctx, const char *event)
 {
+    if (const auto &s = ctx.session()) {
+        int t = int(s->type);
+        if (g_session_type.exchange(t) != t)
+            LOG("session type %d (%s), learnt at %s", t, t == 0 ? "practice" : t == 1 ? "qualifying" : t == 2 ? "race" : t == 3 ? "sprint" : "other", event);
+    }
     const auto &p = ctx.player();
     if (!p)
         return;
@@ -183,7 +210,11 @@ void watch_player_events()
             // a restart or a new session fires race.start / session.start again: start from a clean state
             if (name == "race.start" || name == "session.start") {
                 g_reset_req = true;
+                if (name == "session.start")
+                    g_reset_new_session = true;
                 if (name == "session.start") {
+                    g_player = -1;
+                    sess_t0 = now();
                     // a new session: the start-in-garage countdown begins now, so the car can be parked while the pre-race
                     // menus (setup, strategy) are still up
                     sg_parked = false;
@@ -192,19 +223,20 @@ void watch_player_events()
                 } else {
                     sg_race = true;
                 }
-                if (start_garage && name == "race.start" && sg_parked.load()) {
-                    // parked before the start (or kept parked over a restart): stay in the garage and spectate from now on
-                    kc_broken = true;
-                    kc_since = now();
-                    LOG("%s START IN GARAGE: race.start with your car parked: spectating starts", tstamp().c_str());
-                } else {
-                    if (name == "race.start" && !sg_parked.load())
-                        sg_t0 = now();   // not parked yet (or the option was off before): try again now
-                    kc_broken = false;    // at once, before the tick can send the car to the garage again
-                    kc_since = 0;
-                    kc_garaged = false;
-            kc_parked = 0;   // at once: the game puts the car back on the grid now, the wrap must not hold it
+                if (start_garage && name == "race.start") {
+                    // The game builds the grid after the pre-race menus and puts every car on it, also one parked earlier (log of a
+                    // pre-race parked car that stayed on the grid). So the car is parked again 2 s after the start, the same path that
+                    // already works when it could not be parked before the race, and spectating starts then.
+                    sg_parked = false;
+                    sg_t0 = now();
+                    LOG("%s START IN GARAGE: race.start: your car is parked (again) in 2 s", tstamp().c_str());
+                } else if (name == "race.start" && !sg_parked.load()) {
+                    sg_t0 = now();   // not parked yet (or the option was off before): try again now
                 }
+                kc_broken = false;    // at once, before the tick can send the car to the garage again
+                kc_since = 0;
+                kc_garaged = false;
+                kc_parked = 0;   // at once: the game puts the car back on the grid now, the wrap must not hold it
             }
             // the entrants list (car, team, human) comes with the session events once the grid is known
             auto parts = ctx.participants();
@@ -256,6 +288,14 @@ HANDLE ai_event = nullptr;
 // the port, change the port of one of them.
 std::atomic<int> udp_packets{0};
 
+// The TV director (tv_director.hpp) reads the lap, session, car telemetry and event packets of the same port while the option is on.
+tvd::Director g_tvd;
+
+bool tvd_enabled()
+{
+    return std::string_view(tv_director) == "broadcast";
+}
+
 DWORD WINAPI udp_main(void *)
 {
     WSADATA w;
@@ -265,7 +305,26 @@ DWORD WINAPI udp_main(void *)
     int bound_port = 0;
     std::string last_sig;
     uint8_t buf[2048];
+    bool idle_logged = false;
     for (;;) {
+        // the port is only opened when the data is needed: "park me" and "park my teammate" both on, or the TV director on.
+        // Otherwise no socket at all, so another program (or another addon) can have the port.
+        bool need = (start_garage && park_teammate) || tvd_enabled();
+        if (!need) {
+            if (us != INVALID_SOCKET) {
+                closesocket(us);
+                us = INVALID_SOCKET;
+                bound_port = 0;
+                last_sig.clear();
+                LOG("UDP telemetry: port closed (the teammate option and the TV director are off)");
+            } else if (!idle_logged) {
+                idle_logged = true;
+                LOG("UDP telemetry: not listening (only used for 'park my teammate too' and the TV director)");
+            }
+            Sleep(1000);
+            continue;
+        }
+        idle_logged = false;
         int port = std::atoi(std::string(std::string_view(udp_port)).c_str());
         if (us != INVALID_SOCKET && port != bound_port) {
             closesocket(us);
@@ -290,7 +349,8 @@ DWORD WINAPI udp_main(void *)
                     continue;
                 }
                 bound_port = port;
-                LOG("UDP telemetry: listening on port %d for the participants (teams)", port);
+                LOG("UDP telemetry: listening on port %d (%s%s%s)", port, start_garage && park_teammate ? "teams" : "",
+                    start_garage && park_teammate && tvd_enabled() ? " and " : "", tvd_enabled() ? "TV director" : "");
             } else {
                 Sleep(5000);
                 continue;
@@ -322,6 +382,17 @@ DWORD WINAPI udp_main(void *)
             }
         }
         uint16_t fmt = uint16_t(buf[0] | buf[1] << 8);
+        if (fmt == 2026 && n >= 30 && tvd_enabled()) {
+            // the TV director: session (1), lap data (2), events (3) and car telemetry (6)
+            double tn = now();
+            switch (buf[6]) {
+            case 1: g_tvd.feed_session(buf, n, tn); break;
+            case 2: g_tvd.feed_lap(buf, n, tn); break;
+            case 3: g_tvd.feed_event(buf, n, tn); break;
+            case 6: g_tvd.feed_telemetry(buf, n, tn); break;
+            default: break;
+            }
+        }
         if (fmt != 2026 || n < 30 || buf[6] != 4)
             continue;
         int num = std::min<int>(buf[29], 24);
@@ -547,7 +618,6 @@ double hm_fix_at = 0;
 int hm_fixes = 0;
 uintptr_t hm_addr = 0;   // first mask; the second one is at +4
 uint32_t hm_last[2] = {0xffffffff, 0xffffffff};
-double hm_log = 0;
 
 void hb_find();
 
@@ -661,123 +731,6 @@ void hb_set(bool on)
         on ? "no longer set reason 0" : "restored to the game's own code");
 }
 
-// ---- writer trace (live reverse engineering) -----------------------------------------------------------------------
-// Something still sets hide reason 0 on the race HUD mask although the 19 known instructions are blocked. To find it, a
-// hardware write watchpoint (debug register 0) is put on that mask in every game thread for a few seconds; a vectored
-// exception handler records the address of each instruction that wrote it, then the watchpoint is removed again.
-struct TraceHit {
-    std::atomic<uintptr_t> rip{0};
-    std::atomic<int> count{0};
-};
-TraceHit tr_hits[32];
-std::atomic<bool> tr_armed{false};
-PVOID tr_veh = nullptr;
-double tr_until = 0;
-int tr_runs = 0;
-
-LONG CALLBACK tr_handler(EXCEPTION_POINTERS *e)
-{
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1))
-        return EXCEPTION_CONTINUE_SEARCH;
-    e->ContextRecord->Dr6 = 0;
-    if (!tr_armed.load())
-        return EXCEPTION_CONTINUE_EXECUTION;
-    uintptr_t rip = uintptr_t(e->ExceptionRecord->ExceptionAddress);
-    for (auto &h : tr_hits) {
-        uintptr_t cur = h.rip.load();
-        if (cur == rip) {
-            h.count++;
-            break;
-        }
-        if (cur == 0) {
-            uintptr_t zero = 0;
-            if (h.rip.compare_exchange_strong(zero, rip) || h.rip.load() == rip) {
-                h.count++;
-                break;
-            }
-        }
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-// Puts (on) or removes (off) the watchpoint on the race-HUD mask in every thread of the game except this one.
-int tr_set_all(bool on)
-{
-    int done = 0;
-    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE)
-        return 0;
-    THREADENTRY32 te{};
-    te.dwSize = sizeof te;
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me)
-            continue;
-        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-        if (!t)
-            continue;
-        if (SuspendThread(t) != DWORD(-1)) {
-            CONTEXT c{};
-            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (GetThreadContext(t, &c)) {
-                if (on) {
-                    c.Dr0 = hm_addr;
-                    c.Dr7 = (c.Dr7 & ~(DWORD64(0xF) << 16)) | 1 | (DWORD64(1) << 16) | (DWORD64(3) << 18);   // L0, write, 4 bytes
-                } else {
-                    c.Dr0 = 0;
-                    c.Dr7 &= ~(DWORD64(1) | (DWORD64(0xF) << 16));
-                }
-                if (SetThreadContext(t, &c))
-                    done++;
-            }
-            ResumeThread(t);
-        }
-        CloseHandle(t);
-    }
-    CloseHandle(snap);
-    return done;
-}
-
-void tr_start()
-{
-    if (!hm_addr || tr_runs >= 1 || tr_armed.load())
-        return;
-    tr_runs++;
-    if (!tr_veh)
-        tr_veh = AddVectoredExceptionHandler(1, tr_handler);
-    for (auto &h : tr_hits) {
-        h.rip = 0;
-        h.count = 0;
-    }
-    tr_armed = true;
-    int n = tr_set_all(true);
-    tr_until = now() + 4.0;
-    LOG("%s TRACE #%d ON: write watchpoint on the race-HUD mask in %d thread(s) for 4 s", tstamp().c_str(), tr_runs, n);
-}
-
-void tr_tick()
-{
-    if (!tr_armed.load() || now() < tr_until)
-        return;
-    int n = tr_set_all(false);
-    tr_armed = false;
-    auto mod = uintptr_t(GetModuleHandleW(nullptr));
-    LOG("%s TRACE #%d OFF (%d thread(s) cleared). Instructions that wrote the race-HUD mask:", tstamp().c_str(), tr_runs, n);
-    int shown = 0;
-    for (auto &h : tr_hits) {
-        uintptr_t rip = h.rip.load();
-        if (!rip)
-            continue;
-        shown++;
-        if (rip >= mod && rip < mod + 0x20000000)
-            LOG("   writer after F1_25.exe+%#llx: %d write(s)", (unsigned long long)(rip - mod), h.count.load());
-        else
-            LOG("   writer after %#llx (outside the exe): %d write(s)", (unsigned long long)rip, h.count.load());
-    }
-    if (!shown)
-        LOG("   none caught");
-}
-
 // While we spectate, reason 0 (set by the game's "in-game spectating" state) hides both HUDs: clear it and let the game
 // refresh the HUD with its own update function. Only reason 0 is touched, and only while the director is on.
 void hm_fix()
@@ -810,6 +763,19 @@ bool car_racing(uint32_t car)
     // a car that is still racing: not retired (bit 4), not in the pit lane (bit 0), no terminal damage (bit 9)
     auto st = swofty::cars::live::Car(car).control();
     return st && (st->flags & ((1u << 0) | (1u << 4) | (1u << 9))) == 0;
+}
+
+// the safety car is a vehicle too (controller flag SAFETY_CAR, bit 11): never a car to move the camera to by itself
+bool is_safety_car(uint32_t car)
+{
+    auto st = swofty::cars::live::Car(car).control();
+    return st && (st->flags & (1u << 11)) != 0;
+}
+
+// a car the camera may be moved to by itself: racing and not the safety car
+bool watchable(uint32_t car)
+{
+    return car_racing(car) && !is_safety_car(car);
 }
 
 bool ai_driving()
@@ -864,6 +830,232 @@ int camera_vk()
 // Sends your wrecked car to its garage with the game's own pit lane call (status 9 = in the garage), the same call the game
 // makes for a car that ends its session in the pits. The pit lane system pointer is taken from the game's own calls to it.
 void toast(const char *text, const char *detail);
+
+#if KIZI_PARK
+// ---- park at the safety car's spot (a car with no garage, like the extra F1 World entry) -----------------------------------
+// The game gives a garage to each team of the season's team list, so a car that is not in it stays on the grid. This places the car
+// at the safety car's parking spot in the pit lane instead, with the game's own placement request (Game_Place_Vehicle, the call its
+// pit lane placements use), a few metres behind the safety car. The safety car is the one vehicle in the game's vehicle table that
+// is allocated apart from the race cars (its pointer is far from the one before it). After the first placement the car is pinned to
+// its spot until the session ends or restarts: four times a second its position is read, and when it is more than 0.6 m off (the
+// game's pit lane AI creeps, or the game puts cars back on the grid when the race starts) it is placed again with zero speed.
+// The car is first set to pit state 9 (in the garage) with the game's own pit lane call, and that state is held (kc_parked): the game's
+// auto-reset to track (Game_AutoResetToTrack_StartTimer) only watches cars on track (pit state 1), a slow car off the track surface
+// gets a timer and then RESET_TO_TRACK plus a teleport back to the track. A garage-state car is not watched.
+// With "park_control" (off by default) the car is also given back to you (human controller) the way Manual Pit Lane does it, so the game's pit lane AI
+// does not drive it: the PIT_LANE flag of its ControllerSet is cleared and its control mode set to 0. The mode is stored scrambled
+// (mode = [set+0x10] xor [set+0x18], both rewritten by the game when it changes), and writing it with a stale key made a garbage
+// mode and crashed Sess_ControllerSystem_ApplyInputs once. So the mode is written with a compare-and-swap on the mode dword and then
+// read back against the key again until it decodes to 0. Only when no other flag is set. Keep Manual Pit Lane off for this car.
+uintptr_t pk_table = 0;                  // vehicle table: pk_table + 8 * vehicle id = vehicle*
+bool pk_table_tried = false;
+int pk_hold_car = -1;
+double pk_hold_next = 0, pk_log_at = 0;
+int pk_fixes = 0;
+float pk_worst = 0;
+float pk_target[16];
+
+uint64_t pk_vehicle(int i)
+{
+    uint64_t v = 0;
+    return pk_table && i >= 0 && i < 32 && mem_read(pk_table + 8 * uintptr_t(i), &v, 8) ? v : 0;
+}
+
+// the vehicle's physics transform: 16 floats at [vehicle+0x558]+0x190, rows left / up / forward / position
+bool pk_matrix(uint64_t veh, float m[16])
+{
+    uint64_t phys = 0;
+    return veh && mem_read(veh + 0x558, &phys, 8) && phys && mem_read(phys + 0x190, m, 64);
+}
+
+float pk_behind_m()
+{
+    float v = float(std::atof(std::string(park_behind.get()).c_str()));
+    return v < 0 ? 0 : v > 30 ? 30 : v;
+}
+
+bool park_pit(int me, const char *why)
+{
+    if (!swofty::game::Game_Place_Vehicle.address()) {
+        LOG("%s PARK: Game_Place_Vehicle is not bound on this build: nothing moved", tstamp().c_str());
+        return false;
+    }
+    if (!pk_table && !pk_table_tried) {
+        pk_table_tried = true;
+        uintptr_t at = 0;
+        int hits = swofty::api->scan(".xtls", "48 8D 05 ?? ?? ?? ?? 48 8B 0C F8 48 85 C9 0F 84 ?? ?? ?? ?? 4C 8B B1", &at);
+        int32_t d = 0;
+        if (hits >= 1 && mem_read(at + 3, &d, 4))
+            pk_table = at + 7 + intptr_t(d);
+        LOG("%s PARK: vehicle table %s (matches %d)", tstamp().c_str(), pk_table ? "found" : "NOT found", hits);
+    }
+    uint64_t mine = pk_vehicle(me);
+    int sc = -1;
+    uint64_t prev = 0;
+    float sm[16];
+    for (int i = 0; i < 32 && sc < 0; i++) {
+        uint64_t v = pk_vehicle(i);
+        if (!v)
+            continue;
+        uint64_t gap = prev ? (v > prev ? v - prev : prev - v) : 0;
+        if (prev && gap > 0x1000000 && pk_matrix(v, sm))
+            sc = i;
+        prev = v;
+    }
+    if (!mine || sc < 0) {
+        LOG("%s PARK: no safety car vehicle found in the vehicle table (your car %d %s): nothing moved", tstamp().c_str(), me,
+            mine ? "found" : "not found");
+        return false;
+    }
+    float mm[16] = {};
+    pk_matrix(mine, mm);
+    float back = pk_behind_m();
+    memcpy(pk_target, sm, sizeof pk_target);
+    // rows 0..2 = the axes, row 3 = position; forward = row 2
+    pk_target[12] -= sm[8] * back;
+    pk_target[13] -= sm[9] * back;
+    pk_target[14] -= sm[10] * back;
+    LOG("%s PARK: car %d at %.1f, %.1f, %.1f -> safety car (vehicle %d) at %.1f, %.1f, %.1f, %.0f m behind it: %.1f, %.1f, %.1f (%s)",
+        tstamp().c_str(), me, mm[12], mm[13], mm[14], sc, sm[12], sm[13], sm[14], back, pk_target[12], pk_target[13], pk_target[14], why);
+    // priority 5 beats the game's own pit lane placements (3); flags 0x40 = zero the velocity
+    swofty::game::Game_Place_Vehicle(reinterpret_cast<void *>(mine), "kizi-spectator-park", 5, pk_target, pk_target, 0.0f, 0x40);
+    pk_hold_car = me;
+    pk_hold_next = now() + 0.25;
+    pk_log_at = now() + 5.0;
+    pk_fixes = 0;
+    pk_worst = 0;
+    return true;
+}
+
+// --- the controller set of your car (the car table, found in the game's code as Manual Pit Lane does) -----------------------
+std::vector<kizi::CarTable> pk_tables;
+bool pk_tables_tried = false;
+int pk_pit_bit = 0;
+double pk_ctl_next = 0, pk_ctl_log = 0;
+int pk_ctl_given = 0;
+
+uintptr_t pk_set(int vid, const kizi::CarTable **table)
+{
+    for (const auto &t : pk_tables) {
+        uintptr_t mgr = kizi::q64(t.global);
+        uint64_t b = mgr ? kizi::q64(mgr + t.vec) : 0, e = mgr ? kizi::q64(mgr + t.vec + 8) : 0;
+        if (b && e > b && vid >= 0 && uint64_t(vid) < (e - b) / 8)
+            if (uint64_t set = kizi::q64(b + 8 * uintptr_t(vid))) {
+                *table = &t;
+                return set;
+            }
+    }
+    return 0;
+}
+
+// The game's PIT_LANE flag is cleared (an atomic AND), then, only when no other flag wants the AI, the mode is set to 0.
+bool pk_make_human(uintptr_t set, const kizi::CarTable &t)
+{
+    volatile LONG *flags = reinterpret_cast<volatile LONG *>(set + kizi::CS_FLAGS);
+    LONG bit = LONG(1u << pk_pit_bit);
+    if (*flags & bit)
+        InterlockedAnd(flags, ~bit);
+    if (*flags)
+        return false;   // another flag (not started, safety car...) wants the AI
+    volatile LONG *mode = reinterpret_cast<volatile LONG *>(set + t.mode);
+    volatile LONG *key = reinterpret_cast<volatile LONG *>(set + t.key);
+    for (int tries = 0; tries < 24; tries++) {
+        LONG k = *key, cur = *mode;
+        if ((uint32_t(cur) ^ uint32_t(k)) == 0)
+            return true;   // already you (the game may have rewritten both in the meantime: that decodes right)
+        InterlockedCompareExchange(mode, k, cur);   // mode = 0 xor key, only if the mode dword is still what we read
+    }
+    return (uint32_t(*mode) ^ uint32_t(*key)) == 0;
+}
+
+void pk_find_tables()
+{
+    if (pk_tables_tried)
+        return;
+    pk_tables_tried = true;
+    pk_tables = kizi::find_car_tables(kizi::image_ranges(true));
+    int bit = kizi::controller_flag_bit(kizi::image_ranges(false), "PIT_LANE");
+    pk_pit_bit = bit >= 0 && bit < 32 ? bit : 0;
+    LOG("%s PARK: %zu car table(s) found, PIT_LANE = bit %d (%s)", tstamp().c_str(), pk_tables.size(), pk_pit_bit,
+        bit >= 0 ? "from the flag names" : "assumed");
+}
+
+void pk_control_tick()
+{
+    if (!park_control || pk_hold_car < 0 || now() < pk_ctl_next)
+        return;
+    pk_ctl_next = now() + 0.05;
+    pk_find_tables();
+    const kizi::CarTable *t = nullptr;
+    uintptr_t set = pk_set(pk_hold_car, &t);
+    if (!set || !t)
+        return;
+    uint32_t fl = kizi::u32(set + kizi::CS_FLAGS), mode = kizi::u32(set + t->mode) ^ kizi::u32(set + t->key);
+    if (mode > 1)
+        return;   // not a valid mode right now (the game is rewriting it): leave it alone
+    if (((fl >> pk_pit_bit) & 1) || (mode != 0 && fl == 0)) {
+        if (pk_make_human(set, *t))
+            pk_ctl_given++;
+    }
+    if (now() >= pk_ctl_log) {
+        pk_ctl_log = now() + 5.0;
+        if (pk_ctl_given)
+            LOG("%s PARK: car %d given back to you (human controller) %d time(s) in the last 5 s", tstamp().c_str(), pk_hold_car, pk_ctl_given);
+        pk_ctl_given = 0;
+    }
+}
+
+// Logs every change of the parked car's controller flags and mode, to see if the game's auto-reset (flag RESET_TO_TRACK, bit 15) has it.
+void pk_watch()
+{
+    static double next = 0;
+    static uint32_t last_fl = ~0u, last_mode = ~0u;
+    if (pk_hold_car < 0 || now() < next)
+        return;
+    next = now() + 0.25;
+    pk_find_tables();
+    const kizi::CarTable *t = nullptr;
+    uintptr_t set = pk_set(pk_hold_car, &t);
+    if (!set || !t)
+        return;
+    uint32_t fl = kizi::u32(set + kizi::CS_FLAGS), mode = kizi::u32(set + t->mode) ^ kizi::u32(set + t->key);
+    if (fl != last_fl || mode != last_mode) {
+        LOG("%s PARK: car %d controller flags %#x -> %#x, mode %u -> %u%s", tstamp().c_str(), pk_hold_car, last_fl, fl, last_mode, mode,
+            (fl & 0x8000) ? "  <- RESET_TO_TRACK: the game's auto-reset has the car" : "");
+        last_fl = fl;
+        last_mode = mode;
+    }
+}
+
+// Pins the car to its spot: place it again whenever it is more than 0.6 m away (checked four times a second).
+void pk_tick()
+{
+    pk_control_tick();
+    pk_watch();
+    if (pk_hold_car < 0 || now() < pk_hold_next)
+        return;
+    pk_hold_next = now() + 0.25;
+    uint64_t v = pk_vehicle(pk_hold_car);
+    float m[16];
+    if (!v || !pk_matrix(v, m))
+        return;
+    float dx = m[12] - pk_target[12], dz = m[14] - pk_target[14];
+    float away = std::sqrt(dx * dx + dz * dz);
+    if (away > 0.6f) {
+        swofty::game::Game_Place_Vehicle(reinterpret_cast<void *>(v), "kizi-spectator-park", 5, pk_target, pk_target, 0.0f, 0x40);
+        pk_fixes++;
+        pk_worst = std::max(pk_worst, away);
+    }
+    if (now() >= pk_log_at) {
+        pk_log_at = now() + 5.0;
+        if (pk_fixes)
+            LOG("%s PARK: car %d held at its spot: %d correction(s) in the last 5 s, the largest %.1f m", tstamp().c_str(), pk_hold_car, pk_fixes, pk_worst);
+        pk_fixes = 0;
+        pk_worst = 0;
+    }
+}
+
+#endif  // KIZI_PARK
 
 // Sends car v to its garage (status 9 = in the garage) with the game's own pit lane call and keeps it there.
 bool kc_garage_car(int v, const char *why)
@@ -981,14 +1173,11 @@ void spectate_off(const char *why)
     auto r = swofty::spectator::set_active(false);
     LOG("spectate OFF (%s): set_active(false) -> %s", why, swofty::result_name(r));
     hb_set(false);
-    if (tr_armed.load()) {
-        tr_set_all(false);
-        tr_armed = false;
-    }
     active = false;
     hud_keep = false;
     tries = 0;
     last_following = -2;
+    g_tvd.drop_shot();
     hud_cleanup(why, true);
     g_spec_t0 = 0;
 }
@@ -1046,8 +1235,89 @@ void spectate_on(const char *why)
     LOG("starting camera broadcast: set_camera -> %s", swofty::result_name(c));
 }
 
+// Your car: the one car in human control, looked for a few seconds after the session started (never during the setup of it).
+// Found before AI Drive takes the car, so "keep the race running" still knows your car while the AI drives it.
+// A small timer of the addon's own work (the launcher's perf report showed 0.2 to 0.8 ms per frame): sections are added up and one
+// line "PERF" is written to the log every 60 s. 0 = the whole on_frame, 1 = the key check, 2 = the tick, 3 = learn_me, 4 = the
+// session-over check, 5 = the garage start flow, 6 = the AI Drive event, 7 = the part that only runs while spectating.
+struct Perf {
+    double us[8];
+    long n[8];
+    double worst[8];
+};
+Perf g_perf = {};
+
+LARGE_INTEGER perf_now()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t;
+}
+
+void perf_add(int i, LARGE_INTEGER t0)
+{
+    static double per_us = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1e6 / double(f.QuadPart);
+    }();
+    double us = double(perf_now().QuadPart - t0.QuadPart) * per_us;
+    g_perf.us[i] += us;
+    g_perf.n[i]++;
+    if (us > g_perf.worst[i])
+        g_perf.worst[i] = us;
+}
+
+struct PerfScope {
+    int i;
+    LARGE_INTEGER t0;
+    explicit PerfScope(int i_) : i(i_), t0(perf_now()) {}
+    ~PerfScope() { perf_add(i, t0); }
+};
+
+void perf_report()
+{
+    static double next = 0;
+    if (now() < next)
+        return;
+    bool first = next == 0;
+    next = now() + 60.0;
+    if (first)
+        return;
+    auto avg = [](int i) { return g_perf.n[i] ? g_perf.us[i] / double(g_perf.n[i]) : 0.0; };
+    LOG("PERF last 60 s: on_frame avg %.0f us over %ld calls (worst %.1f ms) = %.2f ms/s; key check %.0f us; tick avg %.0f us over %ld (worst %.1f ms): "
+        "learn %.0f, session-over %.0f, garage start %.0f, AI Drive event %.0f, while spectating %.0f us",
+        avg(0), g_perf.n[0], g_perf.worst[0] / 1000.0, g_perf.us[0] / 1000.0 / 60.0, avg(1), avg(2), g_perf.n[2], g_perf.worst[2] / 1000.0, avg(3), avg(4),
+        avg(5), avg(6), avg(7));
+    g_perf = Perf{};
+}
+
+void learn_me()
+{
+    if (g_player.load() >= 0 || !sess_t0 || now() - sess_t0 < 4.0 || now() < next_learn)
+        return;
+    next_learn = now() + 1.0;
+    for (int c = 0; c < 32; c++)
+        if (auto st = swofty::cars::live::Car(uint32_t(c)).control())
+            if (st->mode == swofty::sessions::Control::human) {
+                g_player = c;
+                LOG("your car is vehicle %d (the car in human control)", c);
+                return;
+            }
+}
+
 void tick()
 {
+    {
+        PerfScope p(3);
+        learn_me();
+    }
+    for (double &t : g_late_cleanup)
+        if (t && now() >= t) {
+            t = 0;
+            if (!active)
+                hud_cleanup("after the restart", false);
+        }
     if (cam_kick_at && now() >= cam_kick_at) {
         cam_kick_at = 0;
         if (int vk = camera_vk()) {
@@ -1066,8 +1336,15 @@ void tick()
     }
     {
         // the session is over when your car no longer reports a controller: stop spectating and forget it
+        PerfScope p(4);
+        static double gone_next = 0;
+        static bool gone_last = false;
         int me0 = g_player.load();
-        bool gone = me0 >= 0 && !swofty::cars::live::Car(uint32_t(me0)).control();
+        if (now() >= gone_next) {   // asked once a second: the core call reads the game's controller sets
+            gone_next = now() + 1.0;
+            gone_last = me0 >= 0 && !swofty::cars::live::Car(uint32_t(me0)).control();
+        }
+        bool gone = me0 >= 0 && gone_last;
         if (!gone)
             kc_session_gone = 0;
         else if (kc_session_gone == 0)
@@ -1086,6 +1363,10 @@ void tick()
             return;
         }
     }
+    LARGE_INTEGER pt_garage = perf_now();
+#if KIZI_PARK
+    pk_tick();
+#endif
     if (start_garage && sg_t0 > 0 && now() - sg_t0 >= 2.0 && !kc_garaged.load()) {
         // spectator mode: park your car in the garage from the start of the race (no crash needed) and spectate
         char how[160] = "";
@@ -1096,9 +1377,30 @@ void tick()
             g_player = found;
             const char *w = sg_race.load() ? "start in the garage (spectator mode)" : "start in the garage, parked before the race (pre-race)";
             LOG("%s START IN GARAGE: your car is %d (%s)", tstamp().c_str(), found, how);
+#if KIZI_PARK
+            bool by_spot = park_where.get() == "pit";
+            if (by_spot) {
+                // Pit state 9 (in the garage) first, and held by the wrap: the game's auto-reset to track only watches cars on track
+                // (pit state 1), so a parked car in this state is not teleported back to the track. Then the placement.
+                kc_garage_car(found, "your car, then the safety car's spot");
+                if (park_pit(found, w)) {
+                    kc_garaged = true;
+                    toast("CAR IN THE PIT LANE", "THE RACE GOES ON");
+                } else {
+                    LOG("%s START IN GARAGE: could not park at the safety car's spot, trying the garage call", tstamp().c_str());
+                    by_spot = false;
+                    kc_garage(w);
+                }
+            } else {
+                kc_garage(w);
+            }
+#else
+            const bool by_spot = false;
             kc_garage(w);
+#endif
             if (kc_garaged.load()) {
-                kc_parked |= 1u << found;
+                if (!by_spot)
+                    kc_parked |= 1u << found;
                 if (park_teammate) {
                     bool guessed = false;
                     int mate = sg_find_mate(found, &guessed);
@@ -1124,13 +1426,16 @@ void tick()
             LOG("START IN GARAGE: waiting (%s; pit lane system %s)", how, sys ? "seen" : "not seen");
         }
     }
+    perf_add(5, pt_garage);
     {
         std::string_view ga = garage_after;
         double limit = ga == "3" ? 3 : ga == "6" ? 6 : ga == "10" ? 10 : 0;
         if (kc_broken.load() && !kc_garaged.load() && limit > 0 && kc_since > 0 && now() - kc_since >= limit)
             kc_garage("the crash message was dropped earlier");
     }
+    LARGE_INTEGER pt_ai = perf_now();
     bool ai = ai_driving();
+    perf_add(6, pt_ai);
     bool out = kc_broken.load();
     if (g_reset_req.exchange(false)) {
         bool was = active;
@@ -1141,8 +1446,16 @@ void tick()
             kc_since = 0;
         kc_vehicle = -1;
         manual_on = false;
-        user_off = false;
+        if (g_reset_new_session.exchange(false)) {
+#if KIZI_PARK
+            pk_hold_car = -1;   // a new session (maybe another track): the spot is looked up again. A restart keeps the pin.
+#endif
+            user_off = false;
+        }   // only a new session clears it: pressing the key off stays off across restarts, even while AI Drive drives
         race_over = false;
+        g_late_cleanup[0] = now() + 1.5;
+        g_late_cleanup[1] = now() + 4.0;
+        g_late_cleanup[2] = now() + 9.0;
         lost_since = 0;
         sg_tries_log = 0;
         LOG("reset: race (re)start or new session, spectating %s, all state cleared", was ? "switched off" : "was off");
@@ -1161,14 +1474,9 @@ void tick()
         spectate_off(manual_on ? "key" : "your car is racing again / AI Drive stopped");
     if (!active)
         return;
+    PerfScope spectating(7);
     hm_watch();
     hb_set(true);
-    tr_tick();
-    if (now() - act_started > 2.0) {
-        uint32_t m0 = 0;
-        if (mem_read(hm_addr, &m0, 4) && (m0 & 1u))
-            tr_start();
-    }
     hm_fix();
     int me = g_player.load();
     auto view = swofty::spectator::current();
@@ -1190,19 +1498,41 @@ void tick()
     } else {
         lost_since = 0;
     }
+    // the TV director (Broadcast style): picks who to show from the UDP data. It only acts while a car is followed (or in the first
+    // seconds after spectating started), so the end-of-race detection above still sees "nobody followed" at the podium.
+    bool dir_moved = false;
+    if (tvd_enabled()) {
+        for (const auto &l : g_tvd.take_logs())
+            LOG("%s DIRECTOR %s", tstamp().c_str(), l.c_str());
+        if (following >= 0 || now() - act_started < 6.0) {
+            auto pk = g_tvd.decide(now(), following, [&](int c) { return c != me && watchable(uint32_t(c)); });
+            if (pk.user_override)
+                LOG("%s DIRECTOR %s", tstamp().c_str(), pk.why.c_str());
+            if (pk.car >= 0) {
+                auto r = swofty::spectator::follow(swofty::cars::live::Car(uint32_t(pk.car)));
+                LOG("%s DIRECTOR -> car %d [%s] %s (was %d): follow -> %s", tstamp().c_str(), pk.car, tvd::kind_name(pk.kind), pk.why.c_str(), following,
+                    swofty::result_name(r));
+                dir_moved = true;
+            }
+        }
+    }
     // your own car is out or sits in the pit lane or garage: watch another car that is still racing
     // (the game's spectator keys can't leave it). Also move on when the followed car has retired.
     bool own_bad = following == me && (pit || out);
     // following -1 = the director has no target (your car vanished after the retire): pick a car too
-    bool other_bad = now() - act_started > 3.0 && (following < 0 || (following != me && !car_racing(uint32_t(following))));
-    if (leave_own_car && me >= 0 && (own_bad || other_bad) && now() - act_started > 1.0 && now() >= next_follow) {
+    // only in a race (or when the session type is not known): in practice and qualifying cars in the pit lane are normal, and the camera
+    // must stay where the viewer put it
+    int stype = g_session_type.load();
+    bool race_like = stype < 0 || stype == 2 || stype == 3;
+    bool other_bad = race_like && now() - act_started > 3.0 && (following < 0 || (following != me && !car_racing(uint32_t(following)) && !is_safety_car(uint32_t(following))));
+    if (leave_own_car && me >= 0 && (own_bad || other_bad) && now() - act_started > 1.0 && now() >= next_follow && !dir_moved) {
         next_follow = now() + (tries < 30 ? 2.0 : 10.0);
         tries++;
         int start = following >= 0 ? following : me;
         int target = -1;
         for (int i = 1; i < 32 && target < 0; i++) {
             int c = (start + i) % 32;
-            if (c != me && car_racing(uint32_t(c)))
+            if (c != me && watchable(uint32_t(c)))
                 target = c;
         }
         if (target < 0) {
@@ -1211,6 +1541,8 @@ void tick()
             auto r = swofty::spectator::follow(swofty::cars::live::Car(uint32_t(target)));
             LOG("AUTO-PICK #%d: %s, follow(car %d) -> %s", tries, own_bad ? "your car is out/in the pits" : "followed car is out", target,
                 swofty::result_name(r));
+            if (tvd_enabled())
+                g_tvd.note_follow(target, now());   // not the viewer's own camera change
         }
     }
     if (following != last_following || now() - last_log > 10.0) {
@@ -1257,8 +1589,13 @@ void tick()
 
 void handle_key()
 {
-    int vk = key_vk(hotkey);
-    bool down = vk && game_in_front() && (GetAsyncKeyState(vk) & 0x8000);
+    static int vk = 0;
+    static double vk_at = -10;
+    if (now() - vk_at > 1.0) {   // the key setting is read once a second, not on every frame
+        vk_at = now();
+        vk = key_vk(hotkey);
+    }
+    bool down = vk && (GetAsyncKeyState(vk) & 0x8000) && game_in_front();
     if (down && !key_was_down) {
         if (active || manual_on) {
             manual_on = false;
@@ -1275,14 +1612,36 @@ void handle_key()
     key_was_down = down;
 }
 
+// Something to react to soon: spectating, a pending cleanup or a garage start, a crashed car, a restart, AI Drive driving. Otherwise the
+// tick is nearly empty and runs twice a second instead of five times.
+bool tick_busy()
+{
+    if (active || manual_on || kc_broken.load() || sg_t0 > 0 || g_reset_req.load() || cam_kick_at > 0 || after_off_log > 0 ||
+        g_late_cleanup[0] > 0 || g_late_cleanup[1] > 0 || g_late_cleanup[2] > 0)
+        return true;
+#if KIZI_PARK
+    if (pk_hold_car >= 0)
+        return true;
+#endif
+    return ai_driving();
+}
+
 void frame(double, void *)
 {
-    handle_key();
+    PerfScope all(0);
+    {
+        PerfScope k(1);
+        handle_key();
+    }
     static double last_tick = 0;
-    if (now() - last_tick < 0.2)
+    if (now() - last_tick < (tick_busy() ? 0.2 : 0.5))
         return;
     last_tick = now();
-    tick();
+    {
+        PerfScope t(2);
+        tick();
+    }
+    perf_report();
 }
 
 }  // namespace
@@ -1324,6 +1683,7 @@ SWOFTY_ON_LOAD
     {
         auto r = swofty::events::on("session.start").after([](std::span<const std::byte>, const swofty::events::Context &ctx) {
             note_player(ctx, "session.start");
+            g_tvd.reset();
             active = false;
             hud_keep = false;
             tries = 0;

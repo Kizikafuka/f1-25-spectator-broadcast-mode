@@ -2,9 +2,9 @@
   "schema_version": 1,
   "id": "kizi.spectator-hud",
   "name": "Spectator/Broadcast Mode",
-  "version": "0.0.34",
+  "version": "0.0.46",
   "author": "Kizi & RK",
-  "description": "Keep your race running after a crash and watch from the broadcast camera, or start the race parked in the garage. First part of the split AI Drive. Idea: Terminal Damage by nyannoying.",
+  "description": "Beta. After you crash the race keeps going and you watch it with the broadcast camera. Can also park you and your teammate in the garage. Idea: Terminal Damage by nyannoying.",
   "license": "MIT",
   "icon": "icon.png",
   "category": "utility",
@@ -29,23 +29,41 @@
       "id": "auto_on",
       "type": "toggle",
       "label": "Watch: start by itself",
-      "description": "Spectate automatically while AI Drive drives or after your crash, and stop when you race again.",
+      "description": "Switches to the broadcast camera by itself when your car is out, or while AI Drive is driving. Turn it off if you only want the AI to drive.",
       "default": true,
       "binds": "native"
     },
     {
       "id": "leave_own_car",
       "type": "toggle",
-      "label": "Watch: move to a car still racing",
-      "description": "If the camera is on your wreck or a car that retires, switch to a car that is still racing.",
+      "label": "Watch: move to a car that is still racing",
+      "description": "If the camera is on your wreck, or on a car that retires, it moves to a car that is still racing. Races only; never the safety car.",
       "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "tv_director",
+      "type": "choice",
+      "label": "Watch: automatic camera director",
+      "description": "Switches the camera by itself like a TV director: crashes, overtakes, pit stops, battles, the leaders at the start and on the last lap, then the winner. Races only. Needs the game's UDP telemetry on (see the page).",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "broadcast",
+          "label": "Broadcast (TV style)"
+        }
+      ],
+      "default": "off",
       "binds": "native"
     },
     {
       "id": "hotkey",
       "type": "choice",
-      "label": "Keys: spectate key",
-      "description": "Turns spectating on and off by hand (none = no key).",
+      "label": "Keys: watch on/off key",
+      "description": "Turns the broadcast camera on and off by hand (default F4). It only works while the game window is in front.",
       "values": [
         "none",
         "F3",
@@ -61,8 +79,8 @@
     {
       "id": "camera_key",
       "type": "choice",
-      "label": "Keys: camera key after spectating",
-      "description": "Pressed once when spectating stops so your camera goes back to normal. Set it to your change-camera key.",
+      "label": "Keys: your camera key",
+      "description": "Pressed once when watching stops, so your own camera comes back. Set it to the key you use to change camera in the game.",
       "values": [
         "C",
         "V",
@@ -75,34 +93,18 @@
       "binds": "native"
     },
     {
-      "id": "bg_run",
-      "type": "toggle",
-      "label": "Window: keep the game running",
-      "description": "The game keeps running and playing sound when you click another window, instead of pausing and muting.",
-      "default": true,
-      "binds": "native"
-    },
-    {
-      "id": "hide_2026_logo",
-      "type": "toggle",
-      "label": "Look: hide the game logo",
-      "description": "Hides the F1 game logo in the spectator HUD's bottom-left corner. A change applies the next time you press Play.",
-      "default": true,
-      "binds": "db"
-    },
-    {
       "id": "keep_race",
       "type": "toggle",
-      "label": "Crash: keep the race running",
-      "description": "The game does not end your race when your car is destroyed. The wreck stays and you watch the rest.",
+      "label": "After a crash: keep the race going",
+      "description": "When your car is destroyed the game normally ends your race. On: the race goes on and you watch the rest.",
       "default": true,
       "binds": "native"
     },
     {
       "id": "garage_after",
       "type": "choice",
-      "label": "Crash: send my wreck to the garage",
-      "description": "The wrecked car goes to its garage after this long and stays there. Needs \"keep the race running\".",
+      "label": "After a crash: put my wreck in the garage",
+      "description": "The wrecked car is moved into its garage after this many seconds and stays there until a restart. Needs \"keep the race going\".",
       "values": [
         {
           "value": "off",
@@ -127,8 +129,8 @@
     {
       "id": "start_garage",
       "type": "toggle",
-      "label": "Garage start: park me before the race",
-      "description": "Your car is sent to the garage when the race session loads (setup and strategy) and you spectate from the start.",
+      "label": "Garage start: park my car before the race",
+      "description": "Your car goes to the garage while you are on the setup and strategy screens, and you watch the whole race. For a spectator team.",
       "default": false,
       "binds": "native"
     },
@@ -136,43 +138,62 @@
       "id": "park_teammate",
       "type": "toggle",
       "label": "Garage start: park my teammate too",
-      "description": "Also sends your teammate to the garage (the other car of your pair). Needs 'park me before the race'.",
+      "description": "Also puts your teammate in the garage. Needs \"park my car\" and the game's UDP telemetry (see the description).",
       "default": true,
       "binds": "native"
     },
     {
+      "id": "bg_run",
+      "type": "toggle",
+      "label": "Window: keep the game running in the background",
+      "description": "The game keeps running and playing sound when you click another window, instead of pausing.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "hide_2026_logo",
+      "type": "toggle",
+      "label": "Look: hide the game logo",
+      "description": "Hides the F1 logo in the corner of the spectator screen. A change applies the next time you press Play.",
+      "default": true,
+      "binds": "db"
+    },
+    {
       "id": "udp_port",
       "type": "choice",
-      "label": "Telemetry: port the game sends to",
-      "description": "The UDP port the game sends its telemetry to (Settings > Telemetry, format 2026). Used to find your teammate.",
+      "label": "Advanced: telemetry port",
+      "description": "The UDP port the game sends its telemetry to (Settings > Telemetry). Only used for \"park my teammate too\".",
       "values": [
         "20777",
         "20778",
         "20779"
       ],
       "default": "20777",
-      "binds": "native"
+      "binds": "native",
+      "hidden": true
     },
     {
       "id": "udp_forward",
       "type": "choice",
-      "label": "Telemetry: pass a copy to another addon",
-      "description": "The game sends to one port only. To use Terminal Damage or SimHub too, set their port to this value and pick the same one here.",
+      "label": "Advanced: pass a copy to another program",
+      "description": "The game sends telemetry to one port only. To use another tool at the same time, set its port to this value.",
       "values": [
         "off",
         "20778",
         "20779"
       ],
       "default": "off",
-      "binds": "native"
+      "binds": "native",
+      "hidden": true
     },
     {
       "id": "debug_log",
       "type": "toggle",
-      "label": "Debug: detailed log",
+      "label": "Advanced: detailed log",
       "description": "Extra lines in the log for bug reports. Turn off if the game stutters.",
       "default": true,
-      "binds": "native"
+      "binds": "native",
+      "hidden": true
     }
   ],
   "operations": {

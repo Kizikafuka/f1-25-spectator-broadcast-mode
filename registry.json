@@ -1,0 +1,14 @@
+{
+  "conflicts": [
+    {
+      "id": "kizikafuka.ai-drive",
+      "version": "<1.0.0",
+      "why": "the old AI Drive + Spectate also controls the spectator camera and HUD"
+    },
+    {
+      "id": "kizi.pitlane",
+      "version": ">=0.0.0",
+      "why": "Manual Pit Lane writes your car's controller in the pit lane, which fights Spectator's garage start and can crash the game. Use one of them"
+    }
+  ]
+}
