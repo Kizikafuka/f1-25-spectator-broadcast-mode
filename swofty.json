@@ -2,10 +2,11 @@
   "schema_version": 1,
   "id": "kizi.spectator-hud",
   "name": "Spectator/Broadcast Mode",
-  "version": "0.0.46",
+  "version": "0.1.11",
   "author": "Kizi & RK",
   "description": "Beta. After you crash the race keeps going and you watch it with the broadcast camera. Can also park you and your teammate in the garage. Idea: Terminal Damage by nyannoying.",
   "license": "MIT",
+  "repository": "https://github.com/Kizikafuka/f1-25-spectator-broadcast-mode",
   "icon": "icon.png",
   "category": "utility",
   "kind": [
@@ -13,7 +14,7 @@
   ],
   "compat": {
     "game": "f1_25",
-    "launcher": ">=1.6.0",
+    "launcher": ">=1.8.19",
     "game_builds": [
       ">=25251167"
     ]
@@ -45,7 +46,7 @@
       "id": "tv_director",
       "type": "choice",
       "label": "Watch: automatic camera director",
-      "description": "Switches the camera by itself like a TV director: crashes, overtakes, pit stops, battles, the leaders at the start and on the last lap, then the winner. Races only. Needs the game's UDP telemetry on (see the page).",
+      "description": "Switches the camera by itself like a TV director: crashes, passes, pit stops, battles, start, last lap, winner. In qualifying: flying laps and purple sectors. Top 10 skips action outside the first 10. Needs the game's UDP telemetry on.",
       "values": [
         {
           "value": "off",
@@ -54,10 +55,55 @@
         {
           "value": "broadcast",
           "label": "Broadcast (TV style)"
+        },
+        {
+          "value": "top10",
+          "label": "Broadcast, top 10 only"
+        },
+        {
+          "value": "action",
+          "label": "Every action (all cars on the lead lap)"
         }
       ],
       "default": "off",
       "binds": "native"
+    },
+    {
+      "id": "panel_mode",
+      "type": "choice",
+      "label": "Web panel (live timing, click to watch)",
+      "description": "A web page on this PC (http://127.0.0.1:8765/, the address is copied to the clipboard) with live timing, telemetry and camera control. Needs the game's UDP telemetry on. Races only.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "on",
+          "label": "On (I open the page myself)"
+        },
+        {
+          "value": "on_open",
+          "label": "On, open my browser when it starts"
+        }
+      ],
+      "default": "off",
+      "binds": "native"
+    },
+    {
+      "id": "panel_port",
+      "type": "choice",
+      "label": "Advanced: web panel port",
+      "description": "The port of the web panel on this PC. Change it only if 8765 is busy.",
+      "values": [
+        "8765",
+        "8766",
+        "8767",
+        "8080"
+      ],
+      "default": "8765",
+      "binds": "native",
+      "hidden": true
     },
     {
       "id": "hotkey",

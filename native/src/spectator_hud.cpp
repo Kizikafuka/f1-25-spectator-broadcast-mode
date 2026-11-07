@@ -32,9 +32,7 @@
 #ifndef KIZI_PARK
 #define KIZI_PARK 0
 #endif
-#if KIZI_PARK
-#include "kizi_cars.hpp"
-#endif
+#include "kizi_cars.hpp"   // controller flag names (CUTSCENE) in every build; the car tables are only used with KIZI_PARK
 
 namespace swofty::game {
 using Game_Pitlane_SetVehicleStatus_t = uint64_t(void *, uint64_t, uint64_t);
@@ -73,6 +71,8 @@ SWOFTY_SETTING(std::string_view, park_behind, "15");
 SWOFTY_SETTING(bool, park_control, false);
 #endif
 SWOFTY_SETTING(bool, bg_run, true);
+SWOFTY_SETTING(std::string_view, panel_mode, "off");   // off, on, on_open
+SWOFTY_SETTING(std::string_view, panel_port, "8765");
 SWOFTY_SETTING(std::string_view, udp_port, "20777");
 SWOFTY_SETTING(std::string_view, udp_forward, "off");
 SWOFTY_SETTING(bool, debug_log, true);
@@ -84,6 +84,13 @@ namespace {
 double now()
 {
     return double(GetTickCount64()) / 1000.0;
+}
+
+// the web panel (broadcast_panel.hpp) is switched on in the settings
+bool panel_on()
+{
+    std::string_view m = panel_mode;
+    return m == "on" || m == "on_open";
 }
 
 double g_spec_t0 = 0;   // when the director was switched on (0 = off): log times are "+seconds" since then
@@ -190,7 +197,7 @@ void note_player(const swofty::events::Context &ctx, const char *event)
         LOG("your car is vehicle %d (learnt at %s)", car, event);
 }
 
-void spectate_off(const char *why);
+void spectate_off(const char *why, bool race_end = false);
 
 void clear_player(const char *event)
 {
@@ -273,6 +280,12 @@ bool user_off = false;           // the key switched spectating off: nothing sta
 bool race_over = false;          // the race ended (podium/cutscene): no spectating until the next race start
 double cam_kick_at = 0;           // when to press the game's camera key once after spectating went off
 double after_off_log = 0;         // when to log the HUD masks after a switch-off
+// The yellow SAFETY CAR banner of the game's spectator HUD stayed up after the safety car came in (switching spectating off and on
+// cleared it). So when the safety car is gone, spectating is switched off and on once, and the car that was watched is followed again.
+bool sc_seen = false;
+double sc_next = 0, sc_bounce_at = 0, bounce_follow_at = 0;
+int bounce_follow = -1;
+double neg_first = 0, pos_since = 0;   // first time the director had no target in this stretch; since when it follows a car again
 double lost_since = 0;           // the director has followed nobody since then (0 = it follows a car)
 bool active = false;             // the director is on (we switched it on)
 std::atomic<bool> hud_keep{false};   // keep the spectator HUD up (read by the hud.spectator.visible handler)
@@ -293,8 +306,15 @@ tvd::Director g_tvd;
 
 bool tvd_enabled()
 {
-    return std::string_view(tv_director) == "broadcast";
+    std::string_view m = tv_director;
+    return m == "broadcast" || m == "top10" || m == "action";
 }
+
+std::atomic<int> g_dir_paused{-1};          // the camera director for the web panel: -1 off, 0 on, N = paused for N more seconds after a manual change
+std::atomic<bool> g_tvd_resume{false};      // the panel's Resume button
+std::atomic<int> g_view_car{-1}, g_view_cam{0};   // what the spectator camera shows (set by the tick, read by the web panel)
+std::atomic<int> g_udp_state{0};   // 0 not listening, 1 listening, 2 port busy (for the web panel's message)
+void bp_packet(const uint8_t *d, int n);   // broadcast_panel.hpp
 
 DWORD WINAPI udp_main(void *)
 {
@@ -309,8 +329,9 @@ DWORD WINAPI udp_main(void *)
     for (;;) {
         // the port is only opened when the data is needed: "park me" and "park my teammate" both on, or the TV director on.
         // Otherwise no socket at all, so another program (or another addon) can have the port.
-        bool need = (start_garage && park_teammate) || tvd_enabled();
+        bool need = (start_garage && park_teammate) || tvd_enabled() || panel_on();
         if (!need) {
+            g_udp_state = 0;
             if (us != INVALID_SOCKET) {
                 closesocket(us);
                 us = INVALID_SOCKET;
@@ -342,6 +363,7 @@ DWORD WINAPI udp_main(void *)
                 a.sin_port = htons(uint16_t(port));
                 a.sin_addr.s_addr = htonl(INADDR_ANY);
                 if (bind(us, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0) {
+                    g_udp_state = 2;
                     LOG("UDP telemetry: port %d is busy (another program uses it): team data not available, change the port in the settings", port);
                     closesocket(us);
                     us = INVALID_SOCKET;
@@ -349,8 +371,9 @@ DWORD WINAPI udp_main(void *)
                     continue;
                 }
                 bound_port = port;
-                LOG("UDP telemetry: listening on port %d (%s%s%s)", port, start_garage && park_teammate ? "teams" : "",
-                    start_garage && park_teammate && tvd_enabled() ? " and " : "", tvd_enabled() ? "TV director" : "");
+                g_udp_state = 1;
+                LOG("UDP telemetry: listening on port %d (%s%s%s%s)", port, start_garage && park_teammate ? "teams" : "",
+                    start_garage && park_teammate && tvd_enabled() ? " and " : "", tvd_enabled() ? "TV director" : "", panel_on() ? " web panel" : "");
             } else {
                 Sleep(5000);
                 continue;
@@ -382,6 +405,8 @@ DWORD WINAPI udp_main(void *)
             }
         }
         uint16_t fmt = uint16_t(buf[0] | buf[1] << 8);
+        if ((fmt == 2026 || fmt == 2025) && n >= 30 && panel_on())
+            bp_packet(buf, n);
         if (fmt == 2026 && n >= 30 && tvd_enabled()) {
             // the TV director: session (1), lap data (2), events (3) and car telemetry (6)
             double tn = now();
@@ -758,18 +783,82 @@ void hm_fix()
             GetCurrentThreadId(), m[0], m[1], after[0], after[1], double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart));
 }
 
+// The controller flags of the cars, read from the game ONE CAR AT A TIME (cf_pump) instead of on every question. The perf report of
+// 0.1.6 (this addon took 10% of a core, with 11-60 ms ticks) came down to Car::control() calls: about 2.5 ms each, and the camera logic
+// asked for several per tick (your car twice, the followed car twice, 32 cars once a second for the safety car). A car that has not
+// been read yet counts as "not racing" for a moment.
+struct CarCf {
+    bool ok = false, human = false;
+    uint32_t flags = 0;
+    double t = 0;   // when it was read (0 = never)
+};
+CarCf g_cf[32];
+long g_cf_calls = 0;
+double g_cf_us = 0;
+
+void cf_fetch(int c)
+{
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    auto st = swofty::cars::live::Car(uint32_t(c)).control();
+    QueryPerformanceCounter(&t1);
+    CarCf &e = g_cf[c];
+    e.ok = st.has_value();
+    e.human = st && st->mode == swofty::sessions::Control::human;
+    e.flags = st ? st->flags : 0;
+    e.t = now();
+    g_cf_calls++;
+    g_cf_us += double(t1.QuadPart - t0.QuadPart) * 1e6 / double(f.QuadPart);
+}
+
+const CarCf &cf(uint32_t c)
+{
+    static const CarCf none;
+    return c < 32 ? g_cf[c] : none;
+}
+
+// Your car about once a second, and (while spectating) `budget` other cars per call: the oldest one first, never-read ones first of all.
+// Cars that do not exist answer "no controller" and are looked at again only every 15 s.
+void cf_pump(int me, bool all, int budget)
+{
+    double t = now();
+    if (me >= 0 && me < 32 && t - g_cf[me].t >= 1.0)
+        cf_fetch(me);
+    if (!all)
+        return;
+    for (int n = 0; n < budget; n++) {
+        int pick = -1;
+        double oldest = 1e18;
+        for (int k = 0; k < 32; k++) {
+            if (k == me)
+                continue;
+            const CarCf &e = g_cf[k];
+            if (e.t != 0 && t - e.t < (e.ok ? 2.0 : 15.0))
+                continue;
+            if (e.t < oldest) {
+                oldest = e.t;
+                pick = k;
+            }
+        }
+        if (pick < 0)
+            return;
+        cf_fetch(pick);
+    }
+}
+
 bool car_racing(uint32_t car)
 {
     // a car that is still racing: not retired (bit 4), not in the pit lane (bit 0), no terminal damage (bit 9)
-    auto st = swofty::cars::live::Car(car).control();
-    return st && (st->flags & ((1u << 0) | (1u << 4) | (1u << 9))) == 0;
+    const CarCf &s = cf(car);
+    return s.ok && (s.flags & ((1u << 0) | (1u << 4) | (1u << 9))) == 0;
 }
 
 // the safety car is a vehicle too (controller flag SAFETY_CAR, bit 11): never a car to move the camera to by itself
 bool is_safety_car(uint32_t car)
 {
-    auto st = swofty::cars::live::Car(car).control();
-    return st && (st->flags & (1u << 11)) != 0;
+    const CarCf &s = cf(car);
+    return s.ok && (s.flags & (1u << 11)) != 0;
 }
 
 // a car the camera may be moved to by itself: racing and not the safety car
@@ -1082,6 +1171,15 @@ bool kc_garage_car(int v, const char *why)
 // Your car: the player index of the telemetry feed (needs the game's UDP telemetry), else the car in human control.
 int sg_find_me(char *how, size_t n)
 {
+    // The car under human control comes first: the game's own controller table is always right. The entrants list can number the
+    // cars differently (a grid with an extra car through the custom-team list put the human at 20 when it was 22, and the wrong
+    // team's car was parked).
+    for (int c = 0; c < 32; c++)
+        if (auto st = swofty::cars::live::Car(uint32_t(c)).control())
+            if (st->mode == swofty::sessions::Control::human) {
+                snprintf(how, n, "human controller on car %d", c);
+                return c;
+            }
     {
         std::lock_guard<std::mutex> g(g_entrants_mu);
         for (const auto &e : g_entrants)
@@ -1162,9 +1260,10 @@ void kc_garage(const char *why)
 }
 
 // Gives the game its own HUD back: spectator mode flag off in the UI registry, then the game recomputes the HUD visibility.
-void hud_cleanup(const char *why, bool was_active);
+bool g_end_hid = false;   // the race HUD was left hidden at the end of a race (podium, cutscene): given back at the next cleanup
+void hud_cleanup(const char *why, bool was_active, bool keep_hidden = false);
 
-void spectate_off(const char *why)
+void spectate_off(const char *why, bool race_end)
 {
     if (!active) {
         hud_cleanup(why, false);
@@ -1178,18 +1277,20 @@ void spectate_off(const char *why)
     tries = 0;
     last_following = -2;
     g_tvd.drop_shot();
-    hud_cleanup(why, true);
+    hud_cleanup(why, true, race_end);
     g_spec_t0 = 0;
 }
 
-void hud_cleanup(const char *why, bool was_active)
+void hud_cleanup(const char *why, bool was_active, bool keep_hidden)
 {
     bool ok = vm_bool("session.spectator_mode", "active", false);
     bool menu = vm_bool("view_model_data.hud_spectator_2.content.spectator_menu_panel", "is_open", false);
     uint32_t m[2] = {0, 0};
     if (hm_addr)
         mem_read(hm_addr, m, 8);
-    if (hm_update && hm_addr)
+    // At the end of a race the game shows the podium or a cutscene: the spectator HUD goes, but the player's race HUD must not come
+    // back (the masks stay as they are, no recompute) until the next race start
+    if (hm_update && hm_addr && !keep_hidden)
         hm_update(reinterpret_cast<void *>(hm_addr));
     // With the director off nothing calls the game's "hide the spectator HUD" any more, so the last "show" stays on screen:
     // call it once (hud_keep is already false, so our own hud.spectator.visible handler leaves it alone).
@@ -1200,7 +1301,15 @@ void hud_cleanup(const char *why, bool was_active)
     }
     // The game's hide function leaves reason 6 on in both masks (nothing clears it while the director is off): that hid the
     // race HUD for good. Clear it again and let the game recompute the visibility.
-    if (hid && hm_addr) {
+    if (keep_hidden)
+        g_end_hid = hid || g_end_hid;
+    else if (g_end_hid && was_active == false) {   // a later cleanup (restart): the HUD is given back now
+        hid = true;
+        g_end_hid = false;
+    } else if (hid) {
+        g_end_hid = false;
+    }
+    if (hid && hm_addr && !keep_hidden) {
         InterlockedAnd(reinterpret_cast<volatile LONG *>(hm_addr), ~0x40L);
         InterlockedAnd(reinterpret_cast<volatile LONG *>(hm_addr + 4), ~0x40L);
         if (hm_update)
@@ -1208,7 +1317,7 @@ void hud_cleanup(const char *why, bool was_active)
     }
     LOG("%s HUD CLEANUP (%s): spectator_mode.active=false %s, menu closed %s, masks %#x/%#x, visibility refreshed %s, game's HUD hide called %s",
         tstamp().c_str(), why, ok ? "set" : "FAILED", menu ? "yes" : "no", m[0], m[1], hm_update ? "yes" : "no", hid ? "yes" : "NO (not bound)");
-    if (was_active) {   // the camera key and the mask log only make sense when the director really was on
+    if (was_active && !keep_hidden) {   // the camera key and the mask log only make sense when the director really was on (not at the podium)
         cam_kick_at = now() + 0.5;
         after_off_log = now() + 0.6;
     }
@@ -1241,9 +1350,9 @@ void spectate_on(const char *why)
 // line "PERF" is written to the log every 60 s. 0 = the whole on_frame, 1 = the key check, 2 = the tick, 3 = learn_me, 4 = the
 // session-over check, 5 = the garage start flow, 6 = the AI Drive event, 7 = the part that only runs while spectating.
 struct Perf {
-    double us[8];
-    long n[8];
-    double worst[8];
+    double us[10];
+    long n[10];
+    double worst[10];
 };
 Perf g_perf = {};
 
@@ -1275,6 +1384,10 @@ struct PerfScope {
     ~PerfScope() { perf_add(i, t0); }
 };
 
+long bp_pages_built();   // broadcast_panel.hpp
+double bp_pages_avg_us();
+void bp_pages_reset();
+
 void perf_report()
 {
     static double next = 0;
@@ -1286,9 +1399,14 @@ void perf_report()
         return;
     auto avg = [](int i) { return g_perf.n[i] ? g_perf.us[i] / double(g_perf.n[i]) : 0.0; };
     LOG("PERF last 60 s: on_frame avg %.0f us over %ld calls (worst %.1f ms) = %.2f ms/s; key check %.0f us; tick avg %.0f us over %ld (worst %.1f ms): "
-        "learn %.0f, session-over %.0f, garage start %.0f, AI Drive event %.0f, while spectating %.0f us",
+        "learn %.0f, session-over %.0f, garage start %.0f, AI Drive event %.0f, while spectating %.0f, car flag reads %.0f us; web panel hook %.0f us "
+        "(worst %.1f ms); car flag reads %ld (avg %.0f us each); panel pages built %ld (avg %.0f us, own thread)",
         avg(0), g_perf.n[0], g_perf.worst[0] / 1000.0, g_perf.us[0] / 1000.0 / 60.0, avg(1), avg(2), g_perf.n[2], g_perf.worst[2] / 1000.0, avg(3), avg(4),
-        avg(5), avg(6), avg(7));
+        avg(5), avg(6), avg(7), avg(9), avg(8), g_perf.worst[8] / 1000.0, g_cf_calls, g_cf_calls ? g_cf_us / double(g_cf_calls) : 0.0, bp_pages_built(),
+        bp_pages_avg_us());
+    g_cf_calls = 0;
+    g_cf_us = 0;
+    bp_pages_reset();
     g_perf = Perf{};
 }
 
@@ -1306,11 +1424,31 @@ void learn_me()
             }
 }
 
+// The bit of the CUTSCENE controller flag (set on your car at the podium, in the results and in cutscenes; AI Drive uses it too),
+// looked up by name once; -1 = not found (the older "director follows nobody" check stays the fallback).
+int cutscene_bit()
+{
+    static int bit = -2;
+    static double next = 0;
+    if (bit >= 0 || (bit == -1 && now() < next))
+        return bit;
+    bit = kizi::controller_flag_bit(kizi::image_ranges(false), "CUTSCENE");
+    if (bit >= 32)
+        bit = -1;
+    next = now() + 60.0;
+    LOG("%s CUTSCENE flag: %s", tstamp().c_str(), bit >= 0 ? ("bit " + std::to_string(bit)).c_str() : "not found (the old end-of-race check is used)");
+    return bit;
+}
+
 void tick()
 {
     {
         PerfScope p(3);
         learn_me();
+    }
+    {
+        PerfScope p(9);
+        cf_pump(g_player.load(), active, active && now() - act_started < 6.0 ? 3 : 1);
     }
     for (double &t : g_late_cleanup)
         if (t && now() >= t) {
@@ -1340,10 +1478,8 @@ void tick()
         static double gone_next = 0;
         static bool gone_last = false;
         int me0 = g_player.load();
-        if (now() >= gone_next) {   // asked once a second: the core call reads the game's controller sets
-            gone_next = now() + 1.0;
-            gone_last = me0 >= 0 && !swofty::cars::live::Car(uint32_t(me0)).control();
-        }
+        (void)gone_next;
+        gone_last = me0 >= 0 && me0 < 32 && g_cf[me0].t > 0 && !g_cf[me0].ok;   // your car is read about once a second (cf_pump)
         bool gone = me0 >= 0 && gone_last;
         if (!gone)
             kc_session_gone = 0;
@@ -1472,8 +1608,15 @@ void tick()
         spectate_on(reason);
     else if (!want && active)
         spectate_off(manual_on ? "key" : "your car is racing again / AI Drive stopped");
-    if (!active)
+    if (!active) {
+        g_dir_paused = -1;
+        g_view_car = -1;
+        g_view_cam = 0;
+        neg_first = pos_since = 0;
+        if (bounce_follow >= 0 && now() > bounce_follow_at + 10.0)
+            bounce_follow = -1;
         return;
+    }
     PerfScope spectating(7);
     hm_watch();
     hb_set(true);
@@ -1481,18 +1624,74 @@ void tick()
     int me = g_player.load();
     auto view = swofty::spectator::current();
     int following = view ? int(view->following.index()) : -1;
-    bool pit = false;
-    if (me >= 0)
-        if (auto st = swofty::cars::live::Car(uint32_t(me)).control())
-            pit = st->pit_lane();
-    // the director follows nobody for 3 s: the race is over (podium, results, a cutscene). Stop and give the game its HUD back.
-    if (following < 0 && now() - act_started > 3.0) {
+    g_view_car = following;
+    g_view_cam = view ? int(view->camera) : 0;
+    bool pit = me >= 0 && cf(uint32_t(me)).ok && (cf(uint32_t(me)).flags & 1u) != 0;
+    // Your car's CUTSCENE flag: the podium, the results or a cutscene. Stop for good (until the next race start) and leave the player's
+    // race HUD hidden. The cool-down lap after the chequered flag does not set it, so it stays watchable.
+    if (me >= 0) {
+        int cb = cutscene_bit();
+        if (cb >= 0 && cf(uint32_t(me)).ok && (cf(uint32_t(me)).flags >> cb & 1)) {
+            race_over = true;
+            lost_since = neg_first = 0;
+            LOG("%s RACE OVER: your car has the CUTSCENE flag (flags %#x), spectating off, race HUD left hidden", tstamp().c_str(), cf(uint32_t(me)).flags);
+            spectate_off("cutscene / podium", true);
+            return;
+        }
+    }
+    // the safety car came in: refresh the spectator HUD (see the comment at sc_seen)
+    if (now() >= sc_next) {
+        sc_next = now() + 1.0;
+        bool any = false;
+        for (uint32_t c = 0; c < 32 && !any; c++)
+            any = is_safety_car(c);
+        if (sc_seen && !any && sc_bounce_at == 0) {
+            sc_bounce_at = now() + 3.0;
+            LOG("%s SAFETY CAR IN: the spectator HUD is refreshed in 3 s (off and on once)", tstamp().c_str());
+        }
+        sc_seen = any;
+    }
+    if (sc_bounce_at && now() >= sc_bounce_at) {
+        sc_bounce_at = 0;
+        int st_t = g_session_type.load();
+        if (!race_over && (st_t < 0 || st_t == 2 || st_t == 3)) {
+            bounce_follow = following;
+            bounce_follow_at = now() + 2.5;
+            LOG("%s SAFETY CAR IN: spectating off, then on again (watching car %d)", tstamp().c_str(), following);
+            spectate_off("safety car in: refreshing the HUD");
+            return;
+        }
+    }
+    if (bounce_follow >= 0 && now() >= bounce_follow_at) {
+        if (bounce_follow != me && watchable(uint32_t(bounce_follow)) && following != bounce_follow) {
+            auto r = swofty::spectator::follow(swofty::cars::live::Car(uint32_t(bounce_follow)));
+            LOG("%s SAFETY CAR IN: follow car %d again -> %s", tstamp().c_str(), bounce_follow, swofty::result_name(r));
+            if (tvd_enabled())
+                g_tvd.note_follow(bounce_follow, now());
+        }
+        bounce_follow = -1;
+    }
+    // Fallback: the director follows nobody for 3 s (podium, results). The auto-pick below used to give it a new car every 2 s and
+    // reset this timer, so also count the time since it FIRST had no target: if it has not followed a car steadily for 8 s since
+    // then, and it is more than 12 s, the race is over.
+    if (following < 0) {
+        if (!neg_first)
+            neg_first = now();
+        pos_since = 0;
+    } else {
+        if (!pos_since)
+            pos_since = now();
+        if (now() - pos_since > 8.0)
+            neg_first = 0;
+    }
+    bool stuck = neg_first && now() - neg_first > 12.0;
+    if ((following < 0 && now() - act_started > 3.0) || stuck) {
         if (lost_since == 0)
             lost_since = now();
-        else if (now() - lost_since > 3.0) {
+        if (now() - lost_since > 3.0 || stuck) {
             race_over = true;
-            lost_since = 0;
-            spectate_off("the director follows nobody for 3 s: race over / cutscene");
+            lost_since = neg_first = 0;
+            spectate_off("the director has no steady target: race over / cutscene", true);
             return;
         }
     } else {
@@ -1502,6 +1701,12 @@ void tick()
     // seconds after spectating started), so the end-of-race detection above still sees "nobody followed" at the podium.
     bool dir_moved = false;
     if (tvd_enabled()) {
+        g_tvd.set_preset(std::string(std::string_view(tv_director)));
+        if (g_tvd_resume.exchange(false)) {
+            g_tvd.resume();
+            LOG("%s DIRECTOR: resumed from the web panel", tstamp().c_str());
+        }
+        g_dir_paused = int(std::ceil(g_tvd.paused_left(now())));
         for (const auto &l : g_tvd.take_logs())
             LOG("%s DIRECTOR %s", tstamp().c_str(), l.c_str());
         if (following >= 0 || now() - act_started < 6.0) {
@@ -1558,11 +1763,11 @@ void tick()
             *mode = "-";
             if (c < 0)
                 return -1;
-            auto st = swofty::cars::live::Car(uint32_t(c)).control();
-            if (!st)
+            const CarCf &s = cf(uint32_t(c));
+            if (!s.ok)
                 return -1;
-            *mode = st->mode == swofty::sessions::Control::human ? "human" : "ai";
-            return int64_t(st->flags);
+            *mode = s.human ? "human" : "ai";
+            return int64_t(s.flags);
         };
         const char *mm = "-", *fm = "-";
         int64_t mf = flags_of(me, &mm), ff = flags_of(following, &fm);
@@ -1626,12 +1831,18 @@ bool tick_busy()
     return ai_driving();
 }
 
+#include "broadcast_panel.hpp"
+
 void frame(double, void *)
 {
     PerfScope all(0);
     {
         PerfScope k(1);
         handle_key();
+    }
+    {
+        PerfScope pb(8);
+        bp_frame();
     }
     static double last_tick = 0;
     if (now() - last_tick < (tick_busy() ? 0.2 : 0.5))
@@ -1654,6 +1865,8 @@ SWOFTY_ON_LOAD
     if (HANDLE t = CreateThread(nullptr, 0, keep_main, nullptr, 0, nullptr))
         CloseHandle(t);
     if (HANDLE t = CreateThread(nullptr, 0, udp_main, nullptr, 0, nullptr))
+        CloseHandle(t);
+    if (HANDLE t = CreateThread(nullptr, 0, bp_main, nullptr, 0, nullptr))
         CloseHandle(t);
     if (keep_race)
         kc_find();

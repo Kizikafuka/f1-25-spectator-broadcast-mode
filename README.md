@@ -22,6 +22,28 @@ When you crash out, the game normally ends your race. This addon keeps the race 
 - **Look:** hide the game logo (applies the next time you press Play).
 - **Advanced** (in the launcher's Addons page): telemetry port, pass a copy to another program, detailed log.
 
+## Web panel (new in 0.1.0, beta)
+**Web panel** (off by default) is a web page on your own PC with the live race, like a timing screen. Turn it on in the addon settings (**On**, or **On, open my browser when it starts**), then open `http://127.0.0.1:8765/` in a browser. The address is also copied to the clipboard each time the panel starts. It needs the game's UDP telemetry on (see below); without it the page says what is missing.
+- **Click a driver's name** (in the table, the track strip, the battles list or the race feed) and the spectator camera follows that car. Spectating must already be on (press your spectate key first). Buttons switch between TV pod and Broadcast; the arrow keys go to the previous/next car. A click pauses the automatic camera director for 60 seconds (the page shows "Auto director paused, click to resume").
+- **Timing table:** position, gap to the leader, interval, tyre, last and best lap, PIT / OUT / STOPPED tags, and an arrow when a car is closing in or falling back.
+- **Track strip:** every car as a dot along the lap, with yellow-flag zones highlighted. **Yellow flags**, the safety car and the virtual safety car show in a banner on top.
+- **Battles:** cars within 1.5 seconds of the car in front, with how fast they close and how many laps until they could pass ("in overtake range" under 1 second).
+- **Race feed:** passes, contact, retirements, fastest lap, safety car changes, penalties, pit in/out, a car slow or stopped on the track (a possible spin), yellow flags appearing and clearing. Click an entry to watch that car.
+- **Telemetry of the watched car:** speed, gear, rpm, throttle, brake, steering, tyre temperatures and wear, fuel laps.
+- **Safety:** this PC only (127.0.0.1), a secret token for the click commands, no CORS. It opens no extra UDP port: it shares the one the camera director uses. When Swofty's own telemetry API is available the panel could use it instead (not yet).
+- **Not checked on every packet layout yet:** the yellow zones, the event feed, tyre temperatures and fuel laps use the standard F1 UDP layouts. If something looks wrong, send the log lines `PANEL sample`, `PANEL cars` and `PANEL click`.
+
+## Qualifying director (0.1.10, not tested in the game yet)
+The automatic camera director (same setting) now also works in **qualifying and the sprint shootout**; practice and time trial stay idle. It needs the game's UDP telemetry on, like in the race.
+- **Flying lap:** a car that starts a flying lap is shown (the better qualifying position first), for up to 25 seconds.
+- **Purple:** a car that sets the fastest sector 1, 2 or 3, or the fastest lap, so far is shown for 9 seconds (valid laps only; the first time set is just the baseline). It takes the camera from a flying car after 6 seconds.
+- **Finish line:** a flying car in sector 3 past 80% of the lap is **held until it has crossed the line**, plus 3 seconds. Only a crash cuts it.
+- **Next car:** then the flying car closest to the line, the one behind it, and so on. Crashes and retirements are shown like in the race.
+- A manual camera change (keys or the web panel) pauses it for 60 seconds, as in the race.
+
+## Performance (0.1.8)
+A perf report of 0.1.6 showed this addon using about 10% of a CPU core (ticks of 11-60 ms). The cause was the game call that reads a car's controller flags (about 2.5 ms each), asked many times per tick. 0.1.8 reads the flags of your car about once a second and of the other cars one at a time (a car's flags can be a few seconds old), and the web panel page is built on its own thread, not the game's. The log line `PERF last 60 s` now also shows the web panel hook, the number and cost of the car flag reads, and the page builds.
+
 ## Automatic camera director (new in 0.0.39, not tested in the game yet)
 **Watch: automatic camera director: Broadcast (TV style)** switches the camera by itself while you watch, like a TV director. It only picks who to show; it never moves the camera itself. It works in **races only** and does nothing before the lights go out.
 - **Crashes and retirements** (and a car stopped on the track): it cuts to the car after about 2 seconds, even in the middle of another shot.
@@ -30,8 +52,12 @@ When you crash out, the game normally ends your race. This addon keeps the race 
 - **Battles:** a car within about 0.7 seconds of the one in front. It stays while the fight lasts and drops it when nothing happens or the cars drift apart.
 - **Quiet moments:** the leaders, in turn, 25 seconds each.
 - **Start:** the leaders for the first 30 seconds. **Last lap:** the leader when it starts and for the last 25 seconds to the flag. **Chequered flag:** the winner, then the fights still going on for position.
+- **0.0.49:** when the safety car comes in, the spectator HUD is refreshed once (spectating off and on, the same car followed again) because the yellow SAFETY CAR banner stayed on screen.
+- **Presets (0.0.48):** *Broadcast* (the rules above), *Broadcast, top 10 only* (passes, fights, pit stops and quiet shots only for the first 10; crashes at any position) and *Every action* (every car on the lead lap, shots of about 12 seconds, fights from 1.0 s, the closest gap when it is quiet). Lapped cars are never shown in a fight or a pass.
+- **0.0.48 changes:** a pass or fight 3-4 places nearer the front cuts in after 5-8 seconds instead of waiting 20 (no more staying with the back of the field while the top has a pass); a pass stays shown-able for 14 seconds; a fight shot ends when the gap is over 1.2 s for 2.5 seconds (was 1.5 s for 4 s).
 - Every shot is held for at least 20 seconds (crashes, the start, the last lap and the finish are the exceptions). Retired cars are never shown, apart from the moment they retire.
-- **If you change the camera yourself,** the director waits 10 seconds. It does nothing while the game is paused.
+- **If you change the camera yourself** (the game's keys, or a click in the web panel), the director waits **60 seconds**; every further change starts the 60 seconds again. In the web panel you can click the "paused" label to let it carry on at once. It does nothing while the game is paused.
+- **Holding (0.1.9):** a fight or a pass that is on screen is held until it is over. Another fight starting elsewhere does not cut it; only a fight 5 places nearer the front (and only when the current pair is not about to swap places), or a pass or a leader's pit stop after about 25 seconds. Crashes, the start, the last lap and the finish always cut in.
 - It follows the TV-director recipe used in the F1 Manager 2024 mod. The hold times and gaps are a first guess and will probably need tuning for F1 25.
 
 ## Turn on UDP telemetry (for "park my teammate too" and the camera director)
